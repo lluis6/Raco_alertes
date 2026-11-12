@@ -17,7 +17,7 @@
  *                                    en la primera ejecución
  *
  * Funciones para ejecutar manualmente: showRedirectUri, authorize, checkAvisos,
- * installTrigger, debugAvisos, resetSeen.
+ * installTrigger, debugAvisos, resetSeen, resendLast3.
  */
 
 const API = 'https://api.fib.upc.edu/v2';
@@ -180,6 +180,36 @@ function checkAvisos() {
   Logger.log(nuevos.length + ' avisos nuevos enviados.');
 }
 
+/** Descarga un adjunto usando el token OAuth2. Devuelve un Blob o null si falla. */
+function fetchAdjunto_(x) {
+  const url = typeof x === 'string' ? x : (x.url || '');
+  if (!url) return null;
+  try {
+    const res = UrlFetchApp.fetch(url, {
+      headers: { Authorization: 'Bearer ' + getService_().getAccessToken() },
+      muteHttpExceptions: true,
+      followRedirects: true
+    });
+    if (res.getResponseCode() !== 200) {
+      Logger.log('Adjunto no descargable (' + res.getResponseCode() + '): ' + url);
+      return null;
+    }
+
+    // Nombre: campo de la API, o cabecera Content-Disposition, o genérico.
+    let name = typeof x === 'string' ? '' : decodeEntities_(x.nom || x.nom_fitxer || '');
+    if (!name || /^https?:/i.test(name)) {
+      const h = res.getHeaders();
+      const cd = h['Content-Disposition'] || h['content-disposition'] || '';
+      const m = cd.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
+      name = m ? decodeURIComponent(m[1]) : 'adjunto';
+    }
+    return res.getBlob().setName(name);
+  } catch (e) {
+    Logger.log('Error descargando adjunto: ' + e.message);
+    return null;
+  }
+}
+
 /** Construye y envía el correo de un aviso. */
 function sendMail_(a) {
   const p = props_();
@@ -189,14 +219,23 @@ function sendMail_(a) {
   const assig = decodeEntities_(a.codi_assig);
   const titol = decodeEntities_(a.titol) || '(sin título)';
   const autor = decodeEntities_(autor_(a));
+  const racoUrl = 'https://raco.fib.upc.edu/avisos/veure.jsp?espai=' + encodeURIComponent(assig);
 
+  // Los adjuntos se descargan con el token y se añaden al correo como archivos.
+  const attachments = [];
   let adjuntos = '';
   if (Array.isArray(a.adjunts) && a.adjunts.length) {
-    adjuntos = '<p><b>Adjuntos:</b></p><ul>' + a.adjunts.map(x => {
-      const url = typeof x === 'string' ? x : (x.url || '');
-      const nom = typeof x === 'string' ? x : (x.nom || x.nom_fitxer || url);
-      return '<li><a href="' + esc_(url) + '">' + esc_(decodeEntities_(nom)) + '</a></li>';
-    }).join('') + '</ul>';
+    const items = a.adjunts.map(x => {
+      const blob = fetchAdjunto_(x);
+      if (blob) {
+        attachments.push(blob);
+        return '<li>' + esc_(blob.getName()) + ' (adjunto a este correo)</li>';
+      }
+      const nom = typeof x === 'string' ? 'adjunto' : (x.nom || x.nom_fitxer || 'adjunto');
+      return '<li>' + esc_(decodeEntities_(nom)) +
+             ' (no se pudo descargar; <a href="' + esc_(racoUrl) + '">descárgalo desde el Racó</a>)</li>';
+    });
+    adjuntos = '<p><b>Adjuntos:</b></p><ul>' + items.join('') + '</ul>';
   }
 
   const html =
@@ -209,17 +248,16 @@ function sendMail_(a) {
     '<b>Modificado:</b> ' + esc_(a.data_modificacio || '') + '<br>' +
     '<b>Caduca:</b> ' + esc_(a.data_caducitat || '') + '</p>' +
     '<hr>' + (a.text || '') + adjuntos +
-    '<hr><p><a href="https://raco.fib.upc.edu/avisos/veure.jsp?espai=' +
-    encodeURIComponent(assig) + '">Ver en el Racó</a></p>' +
+    '<hr><p><a href="' + esc_(racoUrl) + '">Ver en el Racó</a></p>' +
     '</div>';
 
   const subject = '[Racó] ' + (assig ? assig + ': ' : '') + titol;
 
   if (from) {
     // Solo funciona si "from" es un alias "Enviar como" verificado en el Gmail propietario.
-    GmailApp.sendEmail(to, subject, '', { htmlBody: html, from: from });
+    GmailApp.sendEmail(to, subject, '', { htmlBody: html, from: from, attachments: attachments });
   } else {
-    MailApp.sendEmail({ to: to, subject: subject, htmlBody: html });
+    MailApp.sendEmail({ to: to, subject: subject, htmlBody: html, attachments: attachments });
   }
 }
 
@@ -254,4 +292,31 @@ function debugAvisos() {
 /** Olvida los avisos vistos; la siguiente ejecución vuelve a empezar de cero. */
 function resetSeen() {
   props_().deleteProperty('SEEN_IDS');
+}
+
+/**
+ * Reenvía por correo los últimos n avisos (por defecto 3), sin importar si ya se
+ * enviaron. No modifica la lista de avisos vistos. Se envían del más antiguo al más reciente.
+ */
+function resendLast(n) {
+  n = n || 3;
+  let avisos;
+  try {
+    avisos = fetchAvisos_();
+  } catch (e) {
+    Logger.log('Error: ' + e.message);
+    throw e;
+  }
+  const ultimos = avisos
+    .slice()
+    .sort((a, b) => String(b.data_insercio || '').localeCompare(String(a.data_insercio || '')))
+    .slice(0, n)
+    .reverse();
+  ultimos.forEach(sendMail_);
+  Logger.log(ultimos.length + ' avisos reenviados.');
+}
+
+/** Atajo ejecutable desde el editor: reenvía los 3 últimos avisos. */
+function resendLast3() {
+  resendLast(3);
 }
