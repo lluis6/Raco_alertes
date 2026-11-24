@@ -26,6 +26,9 @@ const TOKEN_URL = API + '/o/token/';
 const AVISOS_URL = API + '/jo/avisos/?format=json';
 const MAX_SEEN = 400;                      // IDs recordados (límite de 9 KB por propiedad)
 const ERROR_COOLDOWN_MS = 6 * 3600 * 1000; // como máximo un correo de error cada 6 h
+const FETCH_ATTEMPTS = 4;                  // intentos por petición ante errores temporales (502, 503...)
+const FETCH_BACKOFF_MS = 2000;             // espera inicial entre intentos (se duplica: 2 s, 4 s, 8 s)
+const TRANSIENT_FAILS_BEFORE_MAIL = 3;     // ejecuciones seguidas con error temporal antes de avisar (3 x 10 min)
 
 /* ============================== Utilidades ============================== */
 
@@ -119,27 +122,78 @@ function authCallback(request) {
 
 /* ============================== Lógica principal ============================== */
 
+/** Quita etiquetas HTML y espacios sobrantes para que los mensajes de error sean legibles. */
+function plain_(s) {
+  return String(s || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * UrlFetchApp.fetch con reintentos y espera exponencial ante errores temporales:
+ * excepciones de red, 429 y 5xx (p. ej. el "502 Proxy Error" que a veces devuelve la FIB).
+ * Devuelve siempre la última respuesta (aunque sea un error) o lanza la última excepción.
+ */
+function fetchRetry_(url, options, attempts) {
+  attempts = attempts || FETCH_ATTEMPTS;
+  options = Object.assign({ muteHttpExceptions: true }, options);
+  let lastErr = null;
+  let res = null;
+  for (let i = 0; i < attempts; i++) {
+    if (i > 0) Utilities.sleep(FETCH_BACKOFF_MS * Math.pow(2, i - 1));
+    try {
+      res = UrlFetchApp.fetch(url, options);
+      const code = res.getResponseCode();
+      if (code !== 429 && code < 500) return res;
+      lastErr = null;
+      Logger.log('Intento ' + (i + 1) + '/' + attempts + ': HTTP ' + code);
+    } catch (e) {
+      res = null;
+      lastErr = e;
+      Logger.log('Intento ' + (i + 1) + '/' + attempts + ': ' + e.message);
+    }
+  }
+  if (res) return res;
+  throw lastErr;
+}
+
+/** Crea un error marcado como temporal (reintentable) o permanente. */
+function makeError_(msg, transient) {
+  const e = new Error(msg);
+  e.transient = !!transient;
+  return e;
+}
+
 /** Obtiene los avisos del usuario desde la API. */
 function fetchAvisos_() {
   const service = getService_();
   if (!service.hasAccess()) {
-    throw new Error('Sin autorización: vuelve a ejecutar authorize().');
+    throw makeError_('Sin autorización: vuelve a ejecutar authorize().', false);
   }
 
-  const res = UrlFetchApp.fetch(AVISOS_URL, {
-    headers: {
-      Authorization: 'Bearer ' + service.getAccessToken(),
-      Accept: 'application/json'
-    },
-    muteHttpExceptions: true
-  });
+  let res;
+  try {
+    res = fetchRetry_(AVISOS_URL, {
+      headers: {
+        Authorization: 'Bearer ' + service.getAccessToken(),
+        Accept: 'application/json'
+      }
+    });
+  } catch (e) {
+    // Fallo de red o al renovar el token: se trata como temporal.
+    throw makeError_('Error de red: ' + e.message, true);
+  }
 
   const code = res.getResponseCode();
   if (code !== 200) {
-    throw new Error('HTTP ' + code + ': ' + res.getContentText('UTF-8').slice(0, 500));
+    const transient = code === 429 || code >= 500;
+    throw makeError_('HTTP ' + code + ': ' + plain_(res.getContentText('UTF-8')).slice(0, 300), transient);
   }
 
-  const data = JSON.parse(res.getContentText('UTF-8'));
+  let data;
+  try {
+    data = JSON.parse(res.getContentText('UTF-8'));
+  } catch (e) {
+    throw makeError_('Respuesta no válida de la API: ' + plain_(res.getContentText('UTF-8')).slice(0, 200), true);
+  }
   return Array.isArray(data) ? data : (data.results || []);
 }
 
@@ -154,6 +208,7 @@ function checkAvisos() {
     notifyError_(e);
     return;
   }
+  p.deleteProperty('FAIL_COUNT');
 
   const raw = p.getProperty('SEEN_IDS');
   const firstRun = raw === null;
@@ -185,11 +240,10 @@ function fetchAdjunto_(x) {
   const url = typeof x === 'string' ? x : (x.url || '');
   if (!url) return null;
   try {
-    const res = UrlFetchApp.fetch(url, {
+    const res = fetchRetry_(url, {
       headers: { Authorization: 'Bearer ' + getService_().getAccessToken() },
-      muteHttpExceptions: true,
       followRedirects: true
-    });
+    }, 3);
     if (res.getResponseCode() !== 200) {
       Logger.log('Adjunto no descargable (' + res.getResponseCode() + '): ' + url);
       return null;
@@ -261,15 +315,26 @@ function sendMail_(a) {
   }
 }
 
-/** Avisa por correo de un fallo de consulta, como máximo una vez cada 6 horas. */
+/**
+ * Avisa por correo de un fallo de consulta, como máximo una vez cada 6 horas.
+ * Los errores temporales (502, red...) solo se notifican si se repiten en
+ * TRANSIENT_FAILS_BEFORE_MAIL ejecuciones seguidas; los permanentes (sin
+ * autorización, 401/403...) se notifican de inmediato.
+ */
 function notifyError_(e) {
   const p = props_();
   const now = Date.now();
   Logger.log('Error: ' + e.message);
+
+  const fails = Number(p.getProperty('FAIL_COUNT') || 0) + 1;
+  p.setProperty('FAIL_COUNT', String(fails));
+  if (e.transient && fails < TRANSIENT_FAILS_BEFORE_MAIL) return;
+
   if (now - Number(p.getProperty('LAST_ERROR_TS') || 0) < ERROR_COOLDOWN_MS) return;
   p.setProperty('LAST_ERROR_TS', String(now));
   const to = p.getProperty('EMAIL_TO') || Session.getEffectiveUser().getEmail();
-  MailApp.sendEmail(to, '[Racó] Error al consultar los avisos', String(e.message));
+  MailApp.sendEmail(to, '[Racó] Error al consultar los avisos',
+    String(e.message) + (e.transient ? '\n\n(Fallo repetido en ' + fails + ' consultas seguidas.)' : ''));
 }
 
 /* ============================ Administración ============================ */
