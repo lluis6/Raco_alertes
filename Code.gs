@@ -82,6 +82,18 @@ function autor_(a) {
   return '';
 }
 
+/**
+ * Acorta una fecha de la API ("2026-11-26T14:58:46") a "26/11/2026 14:58".
+ * Si la hora es 00:00 muestra solo la fecha. Otros formatos se dejan igual.
+ */
+function fecha_(s) {
+  const m = String(s || '').match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2}))?/);
+  if (!m) return String(s || '');
+  const dia = m[3] + '/' + m[2] + '/' + m[1];
+  const sinHora = !m[4] || (m[4] === '00' && m[5] === '00');
+  return sinHora ? dia : dia + ' ' + m[4] + ':' + m[5];
+}
+
 /* ============================ Autorización OAuth2 ============================ */
 
 function getService_() {
@@ -298,9 +310,9 @@ function sendMail_(a) {
     '<h2>' + esc_(titol) + '</h2>' +
     '<p><b>Asignatura:</b> ' + esc_(assig) + '<br>' +
     (autor ? '<b>Publicado por:</b> ' + esc_(autor) + '<br>' : '') +
-    '<b>Publicado:</b> ' + esc_(a.data_insercio || '') + '<br>' +
-    '<b>Modificado:</b> ' + esc_(a.data_modificacio || '') + '<br>' +
-    '<b>Caduca:</b> ' + esc_(a.data_caducitat || '') + '</p>' +
+    '<b>Publicado:</b> ' + esc_(fecha_(a.data_insercio)) + '<br>' +
+    '<b>Modificado:</b> ' + esc_(fecha_(a.data_modificacio)) + '<br>' +
+    '<b>Caduca:</b> ' + esc_(fecha_(a.data_caducitat)) + '</p>' +
     '<hr>' + (a.text || '') + adjuntos +
     '<hr><p><a href="' + esc_(racoUrl) + '">Ver en el Racó</a></p>' +
     '</div>';
